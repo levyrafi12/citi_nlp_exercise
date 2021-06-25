@@ -1,6 +1,9 @@
 import random
 import torch
 import torch.nn as nn
+import torch.optim as optim
+
+from training import Trainer
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -13,6 +16,10 @@ from transformers import logging
 
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
+import unittest
+
+test = unittest.TestCase()
+
 logging.set_verbosity_error()
 
 
@@ -21,22 +28,27 @@ class TagModel(nn.Module):
 	A class for tag sequence classifier. It is composed of two layers:
 	bert model and a feed forward layer.
 	"""
-	def __init__(self, in_dim, h_dim, out_dim):
+	def __init__(self, in_dim, h_dim, out_dim, device, freeze):
 		"""
 		:param in_dim: the output dimension of the bert model
 		:param h_dim: the hidden layer dimension of the FF
 		:param out_dim: the output dimension (equal to the number of tag entities).
+		:param freeze: If True, Bert parameters will not be fine tuned.
 		"""
 		super().__init__()
 
-		self.bert = BertModel.from_pretrained('bert-base-cased')
+		self.bert = BertModel.from_pretrained('bert-base-cased').to(device)
 
 		# Instantiate an one-layer feed-forward classifier
 		self.classifier = nn.Sequential(
 			nn.Linear(in_dim, h_dim),
 			nn.ReLU(),
 			nn.Linear(h_dim, out_dim)
-		)
+		).to(device)
+
+		if freeze == True:
+			for param in self.bert.parameters():
+				param.requires_grad = False
 
 	def forward(self, input_ids):
 		"""
@@ -60,8 +72,9 @@ class Tokenizer():
 	"""
 	A wrapper for bert tokenizer
 	"""
-	def __init__(self):
+	def __init__(self, device='cpu'):
 		self.tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+		self.device = device
 		
 	def preprocessing_for_bert(self, sents):
 		"""
@@ -83,73 +96,69 @@ class Tokenizer():
 			input_ids.append(encoded_sent.get('input_ids'))
 
 		# Convert lists to tensors
-		input_ids = torch.tensor(input_ids)
+		input_ids = torch.tensor(input_ids).to(self.device)
 
 		return input_ids
 
-class Trainer():
-	"""
-	a class which contains various tasks related to training.
-	"""
-	def __init__(self, model, loss_fn=nn.CrossEntropyLoss()):
+class TrainerTagging(Trainer):
+	def __init__(self, model, optimizer, n_epochs):
+		super().__init__(model, optimizer, n_epochs)
 		"""
 		:param model: the classifier
-		:param loss_fn
+		:param optimizer:
+		:param loss_fn:
+		:param n_epochs:
 		"""
-		self.model = model
-		self.loss_fn = loss_fn
 
-	def evaluate(self, data_loader):
+	def batch_loss_compute(self, logits, labels):
 		"""
-		Apply batch predictions
-		:param data_loader: the validation set
-		:return the loss and acc per batch 
+ 		Compute loss of a single batch
+		:param logits: shape (B, seq_len, num entities)
+		:param labels: shape (B, seq_len)
+		:return average loss & accuracy
 		"""
-		acc = []
-		losses = []
 
-		print(f'evaluate... num batches {len(data_loader)}')
+		# Get the predictions
+		# shape (B, seq_len)
+		preds = torch.argmax(logits, dim=2)
 
-		# For each batch in our validation set
-		for batch in data_loader:
-			input_ids, labels = batch
+		avg_acc = 0
+		avg_loss = 0
+		seq_len = logits.shape[1]
+		B = logits.shape[0]
+		num_tags = logits.shape[2]
+		device = logits.device
 
-			# Compute logits
-			with torch.no_grad():
-				logits = self.model(input_ids)
+		# for every sequence in batch:
+		for i in range(B):
+			real_seq_len = get_real_seq_len(labels[i])
+			labels_oh = torch.zeros((seq_len, num_tags)).to(device)
+			for j in range(real_seq_len):
+				labels_oh[j, labels[i][j]] = 1
 
-			# print(logits.shape, labels.shape)
+			# compute loss
+			logits_trunc = logits[i, :real_seq_len].view(\
+				(-1, real_seq_len, num_tags))
+			labels_oh = labels_oh[:real_seq_len, :].view(\
+				(-1, real_seq_len, num_tags))
+			avg_loss = (avg_loss * i + self.loss_fn(logits_trunc, labels_oh)) / (i + 1)
+			avg_loss = avg_loss.squeeze()
 
-			# Get the predictions
-			preds = torch.argmax(logits, dim=2)
+			# compute accuracy 
+			num_correct = sum([preds[i, j] == labels[i, j] \
+				for j in range(real_seq_len)]).item()
+			acc = num_correct / real_seq_len
+			avg_acc = (avg_acc * i + acc) / (i + 1)
 
-			batch_loss = 0.0
-			batch_num_correct = 0.0
-			seq_len = logits.shape[1]
-			B = logits.shape[0]
+		return avg_loss, avg_acc
 
-			# for every sequence in batch, compute the loss/acc for every token
-			for i in range(B):
-				loss = 0.0
-				num_correct = 0.0
-				real_seq_len = sum([1 if tag_ind >= 0 else 0 for tag_ind in labels[i]])
-				num_correct = sum([preds[i, j] == labels[i, j] for j in range(real_seq_len)])
-				num_correct = num_correct / real_seq_len
-				batch_num_correct += num_correct
+def get_real_seq_len(labels_seq):
+	"""
+	Get length of sequence with pads
+	"""
+	return sum([1 if tag_ind >= 0 else 0 for tag_ind in labels_seq])
 
-				# Compute loss
-				loss += self.loss_fn(logits[i, :real_seq_len, :], labels[i, :real_seq_len]) 
-
-				loss = loss / real_seq_len
-				batch_loss += loss
-
-			losses.append(loss.item() / B)
-			acc.append(batch_num_correct.item() / B)
-
-			
-		return losses, acc
-
-def create_data_loader(input_ids, tag_seqs, tag_to_inds, sampler):
+def create_data_loader(input_ids, tag_seqs, tag_to_inds, sampler, device='cpu'):
 	"""
 	create data loader for train, validation and test sets (partionining into batches)
 	:param input_ids: tensor of shape (N, seq_len)
@@ -168,7 +177,7 @@ def create_data_loader(input_ids, tag_seqs, tag_to_inds, sampler):
 		tag_seqs_encoded.append(tag_seq_with_pads)
 
 	# Convert labels to a tensor
-	y_data = torch.tensor(tag_seqs_encoded)
+	y_data = torch.tensor(tag_seqs_encoded).to(device)
 
 	# Create the DataLoader for our training/validation set
 	data = TensorDataset(input_ids, y_data)
@@ -235,21 +244,45 @@ def main():
 	print(f'train {len(train_sents)} , valid {len(valid_sents)} , test {len(test_sents)}')
 
 	tag_to_inds = build_tag_to_inds(train_tags + valid_tags)
-	tokenizer = Tokenizer()
+
+	# Make sure you are using GPU
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	print('Using device:', device)
+
+	# In principle we could start the training by freezing Bert parameters 
+	# for a certain amount of epochs and update the FF layer parameters only, 
+	# and then unfreeze Bert, namely, updating or fine tuning its parameters as well, 
+	# for an additional number of epochs (normally with a smaller lr). Here, we update 
+	# Bert parameters immediately, from the first epoch. 
+	model = TagModel(in_dim=768, h_dim=128, out_dim=len(tag_to_inds), \
+		device=device, freeze=False)
+
+	# save few bert weights before fine tuning
+	bert_weight_bef_ft = torch.clone(model.bert.encoder.\
+		layer[0].attention.self.query.weight[0][0:4])
+
+	optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+	tokenizer = Tokenizer(device)
 
 	x_train = tokenizer.preprocessing_for_bert(train_sents)
 	x_valid = tokenizer.preprocessing_for_bert(valid_sents)
 	x_test = tokenizer.preprocessing_for_bert(test_sents)
 
-	train_dl = create_data_loader(x_train, train_tags, tag_to_inds, RandomSampler)
-	valid_dl = create_data_loader(x_valid, valid_tags, tag_to_inds, SequentialSampler)
-	test_dl = create_data_loader(x_test, test_tags, tag_to_inds, SequentialSampler)
+	train_dl = create_data_loader(x_train, train_tags, tag_to_inds, RandomSampler, device)
+	valid_dl = create_data_loader(x_valid, valid_tags, tag_to_inds, SequentialSampler, device)
+	test_dl = create_data_loader(x_test, test_tags, tag_to_inds, SequentialSampler, device)
 
-	tag_model = TagModel(in_dim=768, h_dim=128, out_dim=len(tag_to_inds))
-	trainer = Trainer(tag_model)
-	loss, acc = trainer.evaluate(valid_dl)
-	
-	# print(loss, acc)
+	trainer = TrainerTagging(model, optimizer, n_epochs=4)
+	train_loss, train_acc, valid_loss, valid_acc = trainer.fit(train_dl, valid_dl)
+	# print(train_loss, train_acc, valid_loss, valid_acc)
+
+	# new values of the same weights we have kept before fine tuning
+	bert_weight_aft_ft = model.bert.encoder.\
+		layer[0].attention.self.query.weight[0][0:4]
+
+	test.assertNotEqual(list(bert_weight_bef_ft), list(bert_weight_aft_ft))
+
 
 if __name__ == "__main__":
 	main()
